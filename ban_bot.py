@@ -2,6 +2,7 @@ import asyncio
 import csv
 import io
 import logging
+import os
 from datetime import datetime
 
 import aiohttp
@@ -9,7 +10,7 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, Document
 
 # ── Конфиг ──────────────────────────────────────────────────────────────────
-BOT_TOKEN = "8511607788:AAHLwDs9pQITCtuU37FwROFPsVLpyi3OX50"
+BOT_TOKEN = os.environ["BOT_TOKEN"]
 ADMIN_ID   = 6771729867
 
 CHAT_IDS = [
@@ -42,7 +43,7 @@ async def kick_user(user_id: int, chat_id: int) -> bool:
 
 
 # ── Основной хендлер: документ от админа ────────────────────────────────────
-@dp.message(F.document, F.from_user.id == ADMIN_ID)
+@dp.message(F.chat.type == "private", F.document, F.from_user.id == ADMIN_ID)
 async def handle_csv(message: Message, bot: Bot):
     doc: Document = message.document
 
@@ -102,12 +103,12 @@ async def handle_csv(message: Message, bot: Bot):
 
 
 # ── Прочие сообщения от не-админов ───────────────────────────────────────────
-@dp.message(~(F.from_user.id == ADMIN_ID))
+@dp.message(F.chat.type == "private", ~(F.from_user.id == ADMIN_ID))
 async def deny(message: Message):
     await message.answer("⛔ Нет доступа.")
 
 
-@dp.message(F.from_user.id == ADMIN_ID)
+@dp.message(F.chat.type == "private", F.from_user.id == ADMIN_ID)
 async def admin_hint(message: Message):
     await message.answer("Пришли CSV-файл с user_id для кика.")
 
