@@ -3,15 +3,37 @@ import csv
 import io
 import logging
 import os
-from datetime import datetime
+import secrets
+from dataclasses import dataclass
+from datetime import datetime, timedelta
 
-import aiohttp
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, Document
+
+
+def read_int_env(name: str, default: int, min_value: int, max_value: int | None = None) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    if value < min_value:
+        return default
+    if max_value is not None and value > max_value:
+        return default
+    return value
+
 
 # ── Конфиг ──────────────────────────────────────────────────────────────────
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 ADMIN_ID   = 6771729867
+KICK_ENABLED = os.getenv("KICK_ENABLED", "false").strip().lower() == "true"
+MAX_USERS_PER_RUN = read_int_env("MAX_USERS_PER_RUN", default=50, min_value=1)
+MAX_FILE_BYTES = read_int_env("MAX_FILE_BYTES", default=1_000_000, min_value=1)
+OPERATION_TTL_SECONDS = read_int_env("OPERATION_TTL_SECONDS", default=600, min_value=1)
+BAN_SECONDS = read_int_env("BAN_SECONDS", default=60, min_value=60, max_value=86_400)
 
 CHAT_IDS = [
     -1003419518080,  # канал клуба
@@ -22,6 +44,16 @@ CHAT_IDS = [
 
 DELAY_BETWEEN_USERS = 0.3   # секунд между юзерами (анти-флуд)
 
+
+@dataclass
+class PendingOperation:
+    operation_id: str
+    user_ids: list[int]
+    created_at: datetime
+
+
+PENDING_OPERATIONS: dict[str, PendingOperation] = {}
+
 # ── Логирование ──────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -30,48 +62,93 @@ bot = Bot(token=BOT_TOKEN)
 dp  = Dispatcher()
 
 
-# ── Хелпер: кик из одного чата ───────────────────────────────────────────────
-async def kick_user(user_id: int, chat_id: int) -> bool:
-    """Тестовый режим: только логируем, никого не удаляем."""
-    log.info("dry-run kick user_id=%s chat_id=%s", user_id, chat_id)
-    return True
-
-
-# ── Основной хендлер: документ от админа ────────────────────────────────────
-@dp.message(F.chat.type == "private", F.document, F.from_user.id == ADMIN_ID)
-async def handle_csv(message: Message, bot: Bot):
-    doc: Document = message.document
-
-    # Скачиваем файл
-    file = await bot.get_file(doc.file_id)
-    buf  = io.BytesIO()
-    await bot.download_file(file.file_path, destination=buf)
-    buf.seek(0)
-
-    # Парсим CSV (одна колонка с user_id)
-    text = buf.read().decode("utf-8-sig").replace("\r", "")
-    reader = csv.reader(io.StringIO(text))
+def parse_user_ids(text: str) -> list[int]:
+    reader = csv.reader(io.StringIO(text.replace("\r", "")))
     user_ids = []
+    seen = set()
+
     for row in reader:
         if not row:
             continue
+
         raw = row[0].replace("=", "").strip()
-        if raw.lstrip("-").isdigit():
-            user_ids.append(int(raw))
+        if not raw.isdigit():
+            continue
 
-    if not user_ids:
-        await message.answer("❌ Не нашёл ни одного user_id в файле.")
-        return
+        user_id = int(raw)
+        if user_id <= 0 or user_id in seen:
+            continue
 
-    await message.answer(
-        f"🧪 ТЕСТОВЫЙ РЕЖИМ\n"
-        f"Проверяю {len(user_ids)} пользователей в {len(CHAT_IDS)} чатах.\n"
-        f"Реального удаления нет."
-    )
+        seen.add(user_id)
+        user_ids.append(user_id)
 
+    return user_ids
+
+
+def validate_user_limit(user_ids: list[int], max_users: int = MAX_USERS_PER_RUN) -> None:
+    if len(user_ids) > max_users:
+        raise ValueError(f"Too many user_id: {len(user_ids)} > {max_users}")
+
+
+def create_operation_id() -> str:
+    return f"{datetime.now().strftime('%Y%m%d%H%M%S')}-{secrets.token_hex(3)}"
+
+
+def is_operation_expired(operation: PendingOperation) -> bool:
+    return datetime.now() - operation.created_at > timedelta(seconds=OPERATION_TTL_SECONDS)
+
+
+# ── Хелпер: кик из одного чата ───────────────────────────────────────────────
+async def kick_user(user_id: int, chat_id: int, bot_client: Bot, operation_id: str) -> bool:
+    if not KICK_ENABLED:
+        log.info(
+            "audit operation_id=%s action=dry-run user_id=%s chat_id=%s",
+            operation_id,
+            user_id,
+            chat_id,
+        )
+        return False
+
+    try:
+        until_date = int(datetime.now().timestamp()) + BAN_SECONDS
+        await bot_client.ban_chat_member(
+            chat_id=chat_id,
+            user_id=user_id,
+            until_date=until_date,
+        )
+        log.info(
+            "audit operation_id=%s action=ban status=success user_id=%s chat_id=%s until_date=%s",
+            operation_id,
+            user_id,
+            chat_id,
+            until_date,
+        )
+        return True
+    except Exception as e:
+        log.warning(
+            "audit operation_id=%s action=ban status=error user_id=%s chat_id=%s error=%s",
+            operation_id,
+            user_id,
+            chat_id,
+            e,
+        )
+        return False
+
+
+async def run_operation(operation: PendingOperation, bot_client: Bot) -> str:
     results = []
-    for uid in user_ids:
-        kicks = await asyncio.gather(*[kick_user(uid, cid) for cid in CHAT_IDS])
+    for uid in operation.user_ids:
+        kicks = await asyncio.gather(
+            *[
+                kick_user(
+                    user_id=uid,
+                    chat_id=cid,
+                    bot_client=bot_client,
+                    operation_id=operation.operation_id,
+                )
+                for cid in CHAT_IDS
+            ]
+        )
         results.append({
             "user_id":     uid,
             "chat_kicks":  kicks,
@@ -79,25 +156,117 @@ async def handle_csv(message: Message, bot: Bot):
         })
         await asyncio.sleep(DELAY_BETWEEN_USERS)
 
-    # Формируем отчёт
-    total      = len(results)
-    per_chat   = [sum(1 for r in results if r["chat_kicks"][i]) for i in range(len(CHAT_IDS))]
+    total = len(results)
+    per_chat = [sum(1 for r in results if r["chat_kicks"][i]) for i in range(len(CHAT_IDS))]
+    total_success = sum(1 for r in results if r["any_success"])
+    total_errors = total - total_success
 
     chat_lines = "\n".join(
-        f"— Чат {i+1}: было бы обработано {per_chat[i]}" for i in range(len(CHAT_IDS))
+        f"— Чат {i+1}: {per_chat[i]} успешно" for i in range(len(CHAT_IDS))
     )
 
-    report = (
-        f"📊 ТЕСТОВЫЙ ОТЧЕТ\n\n"
-        f"🧪 Режим: без удаления пользователей\n"
-        f"📊 Пользователей в CSV: {total}\n"
-        f"📊 Чатов в настройке: {len(CHAT_IDS)}\n\n"
+    return (
+        f"📊 ОТЧЕТ О КИКЕ ПОЛЬЗОВАТЕЛЕЙ\n\n"
+        f"🆔 Операция: {operation.operation_id}\n"
+        f"✅ Успешно кикнуто (хотя бы из 1 чата): {total_success}\n"
+        f"❌ Ошибок/не найдено ни в одном чате: {total_errors}\n"
+        f"📊 Всего обработано: {total}\n\n"
         f"📋 По чатам:\n{chat_lines}\n\n"
-        f"⚠️ Реальный кик в этом коде отключен.\n"
         f"⏰ Время: {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}"
     )
 
-    await message.answer(report)
+
+# ── Основной хендлер: документ от админа ────────────────────────────────────
+@dp.message(F.chat.type == "private", F.document, F.from_user.id == ADMIN_ID)
+async def handle_csv(message: Message, bot: Bot):
+    doc: Document = message.document
+
+    if doc.file_size and doc.file_size > MAX_FILE_BYTES:
+        await message.answer(
+            f"❌ Файл слишком большой: {doc.file_size} байт. Лимит: {MAX_FILE_BYTES} байт."
+        )
+        return
+
+    # Скачиваем файл
+    file = await bot.get_file(doc.file_id)
+    buf  = io.BytesIO()
+    await bot.download_file(file.file_path, destination=buf)
+    buf.seek(0)
+
+    try:
+        text = buf.read().decode("utf-8-sig")
+    except UnicodeDecodeError:
+        await message.answer("❌ Не смог прочитать файл. Нужен CSV в UTF-8.")
+        return
+
+    user_ids = parse_user_ids(text)
+
+    if not user_ids:
+        await message.answer("❌ Не нашёл ни одного положительного user_id в файле.")
+        return
+
+    try:
+        validate_user_limit(user_ids)
+    except ValueError:
+        await message.answer(
+            f"❌ В файле {len(user_ids)} user_id, лимит за одну операцию: {MAX_USERS_PER_RUN}."
+        )
+        return
+
+    operation = PendingOperation(
+        operation_id=create_operation_id(),
+        user_ids=user_ids,
+        created_at=datetime.now(),
+    )
+    if KICK_ENABLED:
+        PENDING_OPERATIONS[operation.operation_id] = operation
+
+    mode = "РЕАЛЬНЫЙ КИК ВКЛЮЧЕН" if KICK_ENABLED else "ТЕСТОВЫЙ РЕЖИМ"
+    action = (
+        f"Чтобы запустить реальный кик, отправь:\n"
+        f"CONFIRM {operation.operation_id} {len(user_ids)}"
+        if KICK_ENABLED
+        else "Реального удаления нет. Для включения нужен KICK_ENABLED=true в Railway."
+    )
+
+    await message.answer(
+        f"⚠️ {mode}\n\n"
+        f"🆔 Операция: {operation.operation_id}\n"
+        f"Пользователей в CSV: {len(user_ids)}\n"
+        f"Чатов в настройке: {len(CHAT_IDS)}\n\n"
+        f"{action}"
+    )
+
+
+@dp.message(F.chat.type == "private", F.text, F.from_user.id == ADMIN_ID)
+async def confirm_operation(message: Message, bot: Bot):
+    text = (message.text or "").strip()
+    parts = text.split()
+    if len(parts) != 3 or parts[0] != "CONFIRM":
+        await message.answer("Пришли CSV-файл с user_id для кика.")
+        return
+
+    operation = PENDING_OPERATIONS.get(parts[1])
+    if operation is None:
+        await message.answer("❌ Операция не найдена или бот был перезапущен.")
+        return
+
+    if is_operation_expired(operation):
+        PENDING_OPERATIONS.pop(operation.operation_id, None)
+        await message.answer("❌ Операция устарела. Пришли CSV заново.")
+        return
+
+    if not parts[2].isdigit() or int(parts[2]) != len(operation.user_ids):
+        await message.answer("❌ Количество пользователей в CONFIRM не совпадает с операцией.")
+        return
+
+    if not KICK_ENABLED:
+        await message.answer("🧪 Реальный кик отключен: KICK_ENABLED не равен true.")
+        return
+
+    PENDING_OPERATIONS.pop(operation.operation_id, None)
+    await message.answer(f"⏳ Подтверждено. Начинаю кик операции {operation.operation_id}...")
+    await message.answer(await run_operation(operation, bot))
 
 
 # ── Прочие сообщения от не-админов ───────────────────────────────────────────
