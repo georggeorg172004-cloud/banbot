@@ -32,14 +32,9 @@ dp  = Dispatcher()
 
 # ── Хелпер: кик из одного чата ───────────────────────────────────────────────
 async def kick_user(user_id: int, chat_id: int) -> bool:
-    """ban + unban = кик без вечного бана"""
-    until_date = int(datetime.now().timestamp()) + 60
-    try:
-        await bot.ban_chat_member(chat_id=chat_id, user_id=user_id, until_date=until_date)
-        return True
-    except Exception as e:
-        log.warning("ban %s from %s: %s", user_id, chat_id, e)
-        return False
+    """Тестовый режим: только логируем, никого не удаляем."""
+    log.info("dry-run kick user_id=%s chat_id=%s", user_id, chat_id)
+    return True
 
 
 # ── Основной хендлер: документ от админа ────────────────────────────────────
@@ -68,7 +63,11 @@ async def handle_csv(message: Message, bot: Bot):
         await message.answer("❌ Не нашёл ни одного user_id в файле.")
         return
 
-    await message.answer(f"⏳ Начинаю кик {len(user_ids)} пользователей из {len(CHAT_IDS)} чатов...")
+    await message.answer(
+        f"🧪 ТЕСТОВЫЙ РЕЖИМ\n"
+        f"Проверяю {len(user_ids)} пользователей в {len(CHAT_IDS)} чатах.\n"
+        f"Реального удаления нет."
+    )
 
     results = []
     for uid in user_ids:
@@ -82,20 +81,19 @@ async def handle_csv(message: Message, bot: Bot):
 
     # Формируем отчёт
     total      = len(results)
-    success    = sum(1 for r in results if r["any_success"])
-    not_found  = total - success
     per_chat   = [sum(1 for r in results if r["chat_kicks"][i]) for i in range(len(CHAT_IDS))]
 
     chat_lines = "\n".join(
-        f"— Чат {i+1}: {per_chat[i]} кикнуто" for i in range(len(CHAT_IDS))
+        f"— Чат {i+1}: было бы обработано {per_chat[i]}" for i in range(len(CHAT_IDS))
     )
 
     report = (
-        f"📊 ОТЧЕТ О КИКЕ ПОЛЬЗОВАТЕЛЕЙ\n\n"
-        f"✅ Успешно кикнуто (хотя бы из 1 чата): {success}\n"
-        f"❌ Не найдено ни в одном чате: {not_found}\n"
-        f"📊 Всего обработано: {total}\n\n"
+        f"📊 ТЕСТОВЫЙ ОТЧЕТ\n\n"
+        f"🧪 Режим: без удаления пользователей\n"
+        f"📊 Пользователей в CSV: {total}\n"
+        f"📊 Чатов в настройке: {len(CHAT_IDS)}\n\n"
         f"📋 По чатам:\n{chat_lines}\n\n"
+        f"⚠️ Реальный кик в этом коде отключен.\n"
         f"⏰ Время: {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}"
     )
 
