@@ -53,6 +53,7 @@ class PendingOperation:
 
 
 PENDING_OPERATIONS: dict[str, PendingOperation] = {}
+LATEST_OPERATION_ID: str | None = None
 
 # ── Логирование ──────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -179,6 +180,8 @@ async def run_operation(operation: PendingOperation, bot_client: Bot) -> str:
 # ── Основной хендлер: документ от админа ────────────────────────────────────
 @dp.message(F.chat.type == "private", F.document, F.from_user.id == ADMIN_ID)
 async def handle_csv(message: Message, bot: Bot):
+    global LATEST_OPERATION_ID
+
     doc: Document = message.document
 
     if doc.file_size and doc.file_size > MAX_FILE_BYTES:
@@ -220,11 +223,12 @@ async def handle_csv(message: Message, bot: Bot):
     )
     if KICK_ENABLED:
         PENDING_OPERATIONS[operation.operation_id] = operation
+        LATEST_OPERATION_ID = operation.operation_id
 
     mode = "РЕАЛЬНЫЙ КИК ВКЛЮЧЕН" if KICK_ENABLED else "ТЕСТОВЫЙ РЕЖИМ"
     action = (
-        f"Чтобы запустить реальный кик, отправь:\n"
-        f"CONFIRM {operation.operation_id} {len(user_ids)}"
+        f"Удалить {len(user_ids)} участников из {len(CHAT_IDS)} чатов?\n"
+        f"Напиши yes для запуска или no для отмены."
         if KICK_ENABLED
         else "Реального удаления нет. Для включения нужен KICK_ENABLED=true в Railway."
     )
@@ -240,24 +244,33 @@ async def handle_csv(message: Message, bot: Bot):
 
 @dp.message(F.chat.type == "private", F.text, F.from_user.id == ADMIN_ID)
 async def confirm_operation(message: Message, bot: Bot):
-    text = (message.text or "").strip()
-    parts = text.split()
-    if len(parts) != 3 or parts[0] != "CONFIRM":
+    global LATEST_OPERATION_ID
+
+    text = (message.text or "").strip().lower()
+    if text not in {"yes", "no"}:
         await message.answer("Пришли CSV-файл с user_id для кика.")
         return
 
-    operation = PENDING_OPERATIONS.get(parts[1])
+    if LATEST_OPERATION_ID is None:
+        await message.answer("❌ Нет операции для подтверждения. Пришли CSV заново.")
+        return
+
+    operation = PENDING_OPERATIONS.get(LATEST_OPERATION_ID)
     if operation is None:
+        LATEST_OPERATION_ID = None
         await message.answer("❌ Операция не найдена или бот был перезапущен.")
+        return
+
+    if text == "no":
+        PENDING_OPERATIONS.pop(operation.operation_id, None)
+        LATEST_OPERATION_ID = None
+        await message.answer("✅ Операция отменена.")
         return
 
     if is_operation_expired(operation):
         PENDING_OPERATIONS.pop(operation.operation_id, None)
+        LATEST_OPERATION_ID = None
         await message.answer("❌ Операция устарела. Пришли CSV заново.")
-        return
-
-    if not parts[2].isdigit() or int(parts[2]) != len(operation.user_ids):
-        await message.answer("❌ Количество пользователей в CONFIRM не совпадает с операцией.")
         return
 
     if not KICK_ENABLED:
@@ -265,6 +278,7 @@ async def confirm_operation(message: Message, bot: Bot):
         return
 
     PENDING_OPERATIONS.pop(operation.operation_id, None)
+    LATEST_OPERATION_ID = None
     await message.answer(f"⏳ Подтверждено. Начинаю кик операции {operation.operation_id}...")
     await message.answer(await run_operation(operation, bot))
 

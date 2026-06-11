@@ -100,7 +100,7 @@ class SafetyTests(unittest.TestCase):
         self.assertFalse(result)
         self.assertEqual(fake_bot.bans, [])
 
-    def test_confirm_does_not_execute_when_real_mode_is_disabled(self):
+    def test_yes_does_not_execute_when_real_mode_is_disabled(self):
         fake_bot = FakeBot()
         operation = ban_bot.PendingOperation(
             operation_id="op-test",
@@ -108,8 +108,9 @@ class SafetyTests(unittest.TestCase):
             created_at=ban_bot.datetime.now(),
         )
         ban_bot.PENDING_OPERATIONS[operation.operation_id] = operation
+        ban_bot.LATEST_OPERATION_ID = operation.operation_id
         ban_bot.KICK_ENABLED = False
-        message = FakeMessage("CONFIRM op-test 1")
+        message = FakeMessage("yes")
 
         asyncio.run(ban_bot.confirm_operation(message, fake_bot))
 
@@ -119,7 +120,7 @@ class SafetyTests(unittest.TestCase):
             ["🧪 Реальный кик отключен: KICK_ENABLED не равен true."],
         )
 
-    def test_confirm_rejects_wrong_user_count(self):
+    def test_no_cancels_latest_operation(self):
         fake_bot = FakeBot()
         operation = ban_bot.PendingOperation(
             operation_id="op-test",
@@ -127,16 +128,47 @@ class SafetyTests(unittest.TestCase):
             created_at=ban_bot.datetime.now(),
         )
         ban_bot.PENDING_OPERATIONS[operation.operation_id] = operation
+        ban_bot.LATEST_OPERATION_ID = operation.operation_id
         ban_bot.KICK_ENABLED = True
-        message = FakeMessage("CONFIRM op-test 1")
+        message = FakeMessage("no")
 
         asyncio.run(ban_bot.confirm_operation(message, fake_bot))
 
         self.assertEqual(fake_bot.bans, [])
+        self.assertNotIn(operation.operation_id, ban_bot.PENDING_OPERATIONS)
+        self.assertIsNone(ban_bot.LATEST_OPERATION_ID)
         self.assertEqual(
             message.answers,
-            ["❌ Количество пользователей в CONFIRM не совпадает с операцией."],
+            ["✅ Операция отменена."],
         )
+
+    def test_yes_runs_latest_operation_only(self):
+        fake_bot = FakeBot()
+        old_operation = ban_bot.PendingOperation(
+            operation_id="old-op",
+            user_ids=[111],
+            created_at=ban_bot.datetime.now(),
+        )
+        latest_operation = ban_bot.PendingOperation(
+            operation_id="latest-op",
+            user_ids=[222],
+            created_at=ban_bot.datetime.now(),
+        )
+        ban_bot.PENDING_OPERATIONS[old_operation.operation_id] = old_operation
+        ban_bot.PENDING_OPERATIONS[latest_operation.operation_id] = latest_operation
+        ban_bot.LATEST_OPERATION_ID = latest_operation.operation_id
+        ban_bot.KICK_ENABLED = True
+        ban_bot.CHAT_IDS = [-1001]
+        message = FakeMessage("yes")
+
+        asyncio.run(ban_bot.confirm_operation(message, fake_bot))
+
+        self.assertEqual(len(fake_bot.bans), 1)
+        self.assertEqual(fake_bot.bans[0]["user_id"], 222)
+        self.assertIn(old_operation.operation_id, ban_bot.PENDING_OPERATIONS)
+        self.assertNotIn(latest_operation.operation_id, ban_bot.PENDING_OPERATIONS)
+        self.assertIsNone(ban_bot.LATEST_OPERATION_ID)
+        self.assertTrue(message.answers[0].startswith("⏳ Подтверждено."))
 
     def test_real_mode_calls_telegram_ban_api_once(self):
         fake_bot = FakeBot()
