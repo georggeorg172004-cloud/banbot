@@ -52,6 +52,13 @@ class PendingOperation:
     created_at: datetime
 
 
+@dataclass
+class KickResult:
+    user_id: int
+    chat_id: int
+    status: str
+
+
 PENDING_OPERATIONS: dict[str, PendingOperation] = {}
 LATEST_OPERATION_ID: str | None = None
 
@@ -99,8 +106,42 @@ def is_operation_expired(operation: PendingOperation) -> bool:
     return datetime.now() - operation.created_at > timedelta(seconds=OPERATION_TTL_SECONDS)
 
 
+def is_not_member_error(error: Exception) -> bool:
+    text = str(error).lower()
+    return any(
+        pattern in text
+        for pattern in (
+            "user not found",
+            "member not found",
+            "participant_id_invalid",
+            "user_not_participant",
+        )
+    )
+
+
 # ── Хелпер: кик из одного чата ───────────────────────────────────────────────
-async def kick_user(user_id: int, chat_id: int, bot_client: Bot, operation_id: str) -> bool:
+async def kick_user(user_id: int, chat_id: int, bot_client: Bot, operation_id: str) -> KickResult:
+    try:
+        await bot_client.get_chat_member(chat_id=chat_id, user_id=user_id)
+    except Exception as e:
+        if is_not_member_error(e):
+            log.info(
+                "audit operation_id=%s action=check status=not_member user_id=%s chat_id=%s",
+                operation_id,
+                user_id,
+                chat_id,
+            )
+            return KickResult(user_id=user_id, chat_id=chat_id, status="not_member")
+
+        log.warning(
+            "audit operation_id=%s action=check status=error user_id=%s chat_id=%s error=%s",
+            operation_id,
+            user_id,
+            chat_id,
+            e,
+        )
+        return KickResult(user_id=user_id, chat_id=chat_id, status="error")
+
     if not KICK_ENABLED:
         log.info(
             "audit operation_id=%s action=dry-run user_id=%s chat_id=%s",
@@ -108,7 +149,7 @@ async def kick_user(user_id: int, chat_id: int, bot_client: Bot, operation_id: s
             user_id,
             chat_id,
         )
-        return False
+        return KickResult(user_id=user_id, chat_id=chat_id, status="found")
 
     try:
         until_date = int(datetime.now().timestamp()) + BAN_SECONDS
@@ -124,7 +165,7 @@ async def kick_user(user_id: int, chat_id: int, bot_client: Bot, operation_id: s
             chat_id,
             until_date,
         )
-        return True
+        return KickResult(user_id=user_id, chat_id=chat_id, status="removed")
     except Exception as e:
         log.warning(
             "audit operation_id=%s action=ban status=error user_id=%s chat_id=%s error=%s",
@@ -133,7 +174,7 @@ async def kick_user(user_id: int, chat_id: int, bot_client: Bot, operation_id: s
             chat_id,
             e,
         )
-        return False
+        return KickResult(user_id=user_id, chat_id=chat_id, status="error")
 
 
 async def run_operation(operation: PendingOperation, bot_client: Bot) -> str:
@@ -150,28 +191,35 @@ async def run_operation(operation: PendingOperation, bot_client: Bot) -> str:
                 for cid in CHAT_IDS
             ]
         )
-        results.append({
-            "user_id":     uid,
-            "chat_kicks":  kicks,
-            "any_success": any(kicks),
-        })
+        results.extend(kicks)
         await asyncio.sleep(DELAY_BETWEEN_USERS)
 
-    total = len(results)
-    per_chat = [sum(1 for r in results if r["chat_kicks"][i]) for i in range(len(CHAT_IDS))]
-    total_success = sum(1 for r in results if r["any_success"])
-    total_errors = total - total_success
+    found = sum(1 for r in results if r.status in {"found", "removed"})
+    removed = sum(1 for r in results if r.status == "removed")
+    not_member = sum(1 for r in results if r.status == "not_member")
+    errors = sum(1 for r in results if r.status == "error")
+    touched_users = len({r.user_id for r in results if r.status == "removed"})
 
     chat_lines = "\n".join(
-        f"— Чат {i+1}: {per_chat[i]} успешно" for i in range(len(CHAT_IDS))
+        (
+            f"— Чат {i+1}: "
+            f"найдено {sum(1 for r in results if r.chat_id == chat_id and r.status in {'found', 'removed'})}, "
+            f"удалено {sum(1 for r in results if r.chat_id == chat_id and r.status == 'removed')}, "
+            f"не участники {sum(1 for r in results if r.chat_id == chat_id and r.status == 'not_member')}, "
+            f"ошибок {sum(1 for r in results if r.chat_id == chat_id and r.status == 'error')}"
+        )
+        for i, chat_id in enumerate(CHAT_IDS)
     )
 
     return (
         f"📊 ОТЧЕТ О КИКЕ ПОЛЬЗОВАТЕЛЕЙ\n\n"
         f"🆔 Операция: {operation.operation_id}\n"
-        f"✅ Успешно кикнуто (хотя бы из 1 чата): {total_success}\n"
-        f"❌ Ошибок/не найдено ни в одном чате: {total_errors}\n"
-        f"📊 Всего обработано: {total}\n\n"
+        f"📊 Пользователей в CSV: {len(operation.user_ids)}\n"
+        f"🔎 Найдено в чатах: {found}\n"
+        f"✅ Успешно удалено: {removed}\n"
+        f"👤 Затронуто уникальных пользователей: {touched_users}\n"
+        f"➖ Не были участниками: {not_member}\n"
+        f"❌ Ошибки прав/API: {errors}\n\n"
         f"📋 По чатам:\n{chat_lines}\n\n"
         f"⏰ Время: {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}"
     )

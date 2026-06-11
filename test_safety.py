@@ -55,9 +55,18 @@ import ban_bot
 class FakeBot:
     def __init__(self):
         self.bans = []
+        self.members = {}
 
     async def ban_chat_member(self, **kwargs):
         self.bans.append(kwargs)
+
+    async def get_chat_member(self, chat_id, user_id):
+        result = self.members.get((chat_id, user_id))
+        if isinstance(result, Exception):
+            raise result
+        if result is None:
+            raise Exception("user not found")
+        return result
 
 
 class FakeMessage:
@@ -86,6 +95,7 @@ class SafetyTests(unittest.TestCase):
 
     def test_dry_run_does_not_call_telegram_ban_api(self):
         fake_bot = FakeBot()
+        fake_bot.members[(-1001, 123)] = object()
         ban_bot.KICK_ENABLED = False
 
         result = asyncio.run(
@@ -97,7 +107,7 @@ class SafetyTests(unittest.TestCase):
             )
         )
 
-        self.assertFalse(result)
+        self.assertEqual(result.status, "found")
         self.assertEqual(fake_bot.bans, [])
 
     def test_yes_does_not_execute_when_real_mode_is_disabled(self):
@@ -159,6 +169,7 @@ class SafetyTests(unittest.TestCase):
         ban_bot.LATEST_OPERATION_ID = latest_operation.operation_id
         ban_bot.KICK_ENABLED = True
         ban_bot.CHAT_IDS = [-1001]
+        fake_bot.members[(-1001, 222)] = object()
         message = FakeMessage("yes")
 
         asyncio.run(ban_bot.confirm_operation(message, fake_bot))
@@ -172,6 +183,7 @@ class SafetyTests(unittest.TestCase):
 
     def test_real_mode_calls_telegram_ban_api_once(self):
         fake_bot = FakeBot()
+        fake_bot.members[(-1001, 123)] = object()
         ban_bot.KICK_ENABLED = True
 
         result = asyncio.run(
@@ -183,7 +195,7 @@ class SafetyTests(unittest.TestCase):
             )
         )
 
-        self.assertTrue(result)
+        self.assertEqual(result.status, "removed")
         self.assertEqual(len(fake_bot.bans), 1)
         self.assertEqual(fake_bot.bans[0]["chat_id"], -1001)
         self.assertEqual(fake_bot.bans[0]["user_id"], 123)
@@ -207,3 +219,23 @@ class SafetyTests(unittest.TestCase):
                 call_owners.append(current.name)
 
         self.assertEqual(call_owners, ["kick_user"])
+
+    def test_run_operation_reports_found_removed_and_not_member(self):
+        fake_bot = FakeBot()
+        fake_bot.members[(-1001, 111)] = object()
+        fake_bot.members[(-1001, 222)] = Exception("user not found")
+        ban_bot.KICK_ENABLED = True
+        ban_bot.CHAT_IDS = [-1001]
+        operation = ban_bot.PendingOperation(
+            operation_id="op-test",
+            user_ids=[111, 222],
+            created_at=ban_bot.datetime.now(),
+        )
+
+        report = asyncio.run(ban_bot.run_operation(operation, fake_bot))
+
+        self.assertEqual(len(fake_bot.bans), 1)
+        self.assertEqual(fake_bot.bans[0]["user_id"], 111)
+        self.assertIn("Найдено в чатах: 1", report)
+        self.assertIn("Успешно удалено: 1", report)
+        self.assertIn("Не были участниками: 1", report)
