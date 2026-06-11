@@ -120,7 +120,7 @@ class SafetyTests(unittest.TestCase):
         ban_bot.PENDING_OPERATIONS[operation.operation_id] = operation
         ban_bot.LATEST_OPERATION_ID = operation.operation_id
         ban_bot.KICK_ENABLED = False
-        message = FakeMessage("yes")
+        message = FakeMessage("yes 1")
 
         asyncio.run(ban_bot.confirm_operation(message, fake_bot))
 
@@ -152,7 +152,47 @@ class SafetyTests(unittest.TestCase):
             ["✅ Операция отменена."],
         )
 
-    def test_yes_runs_latest_operation_only(self):
+    def test_yes_without_count_does_not_run_operation(self):
+        fake_bot = FakeBot()
+        operation = ban_bot.PendingOperation(
+            operation_id="op-test",
+            user_ids=[123],
+            created_at=ban_bot.datetime.now(),
+        )
+        ban_bot.PENDING_OPERATIONS[operation.operation_id] = operation
+        ban_bot.LATEST_OPERATION_ID = operation.operation_id
+        ban_bot.KICK_ENABLED = True
+        message = FakeMessage("yes")
+
+        asyncio.run(ban_bot.confirm_operation(message, fake_bot))
+
+        self.assertEqual(fake_bot.bans, [])
+        self.assertEqual(
+            message.answers,
+            ["❌ Для запуска напиши yes и количество пользователей, например: yes 1"],
+        )
+
+    def test_yes_rejects_wrong_user_count(self):
+        fake_bot = FakeBot()
+        operation = ban_bot.PendingOperation(
+            operation_id="op-test",
+            user_ids=[123, 456],
+            created_at=ban_bot.datetime.now(),
+        )
+        ban_bot.PENDING_OPERATIONS[operation.operation_id] = operation
+        ban_bot.LATEST_OPERATION_ID = operation.operation_id
+        ban_bot.KICK_ENABLED = True
+        message = FakeMessage("yes 1")
+
+        asyncio.run(ban_bot.confirm_operation(message, fake_bot))
+
+        self.assertEqual(fake_bot.bans, [])
+        self.assertEqual(
+            message.answers,
+            ["❌ Количество пользователей не совпадает с операцией."],
+        )
+
+    def test_yes_with_count_runs_latest_operation_only(self):
         fake_bot = FakeBot()
         old_operation = ban_bot.PendingOperation(
             operation_id="old-op",
@@ -170,7 +210,7 @@ class SafetyTests(unittest.TestCase):
         ban_bot.KICK_ENABLED = True
         ban_bot.CHAT_IDS = [-1001]
         fake_bot.members[(-1001, 222)] = object()
-        message = FakeMessage("yes")
+        message = FakeMessage("yes 1")
 
         asyncio.run(ban_bot.confirm_operation(message, fake_bot))
 

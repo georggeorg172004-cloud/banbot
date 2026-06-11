@@ -276,7 +276,7 @@ async def handle_csv(message: Message, bot: Bot):
     mode = "РЕАЛЬНЫЙ КИК ВКЛЮЧЕН" if KICK_ENABLED else "ТЕСТОВЫЙ РЕЖИМ"
     action = (
         f"Удалить {len(user_ids)} участников из {len(CHAT_IDS)} чатов?\n"
-        f"Напиши yes для запуска или no для отмены."
+        f"Напиши yes {len(user_ids)} для запуска или no для отмены."
         if KICK_ENABLED
         else "Реального удаления нет. Для включения нужен KICK_ENABLED=true в Railway."
     )
@@ -295,7 +295,9 @@ async def confirm_operation(message: Message, bot: Bot):
     global LATEST_OPERATION_ID
 
     text = (message.text or "").strip().lower()
-    if text not in {"yes", "no"}:
+    parts = text.split()
+    command = parts[0] if parts else ""
+    if command not in {"yes", "no"}:
         await message.answer("Пришли CSV-файл с user_id для кика.")
         return
 
@@ -309,10 +311,20 @@ async def confirm_operation(message: Message, bot: Bot):
         await message.answer("❌ Операция не найдена или бот был перезапущен.")
         return
 
-    if text == "no":
+    if command == "no":
         PENDING_OPERATIONS.pop(operation.operation_id, None)
         LATEST_OPERATION_ID = None
         await message.answer("✅ Операция отменена.")
+        return
+
+    if len(parts) != 2 or not parts[1].isdigit():
+        await message.answer(
+            f"❌ Для запуска напиши yes и количество пользователей, например: yes {len(operation.user_ids)}"
+        )
+        return
+
+    if int(parts[1]) != len(operation.user_ids):
+        await message.answer("❌ Количество пользователей не совпадает с операцией.")
         return
 
     if is_operation_expired(operation):
